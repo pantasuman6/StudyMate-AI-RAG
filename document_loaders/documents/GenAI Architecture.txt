@@ -1,0 +1,82 @@
+GenAI Architecture
+Frontend / UI — The chat interface users type into. Built with React, Vue, or Next.js. Handles rendering streamed AI responses token-by-token.
+
+WebSocket / SSE — Instead of waiting for the entire AI response, the server streams words as they're generated using Server-Sent Events or WebSockets. This is why ChatGPT appears to "type" responses.
+
+Auth Provider — Verifies who the user is. Issues JWT (JSON Web Tokens) or uses OAuth 2.0 / SSO (Google login, etc.). The token is attached to every API request as proof of identity.
+
+CDN — A Content Delivery Network (like Cloudflare) serves static files (JS, CSS, images) from servers geographically close to the user, making the app load fast worldwide.
+
+API Gateway / Load Balancer — The single entry point for all requests. It routes traffic to the right backend service, handles HTTPS/TLS encryption, and balances load across multiple server instances.
+
+Authentication Middleware — On every request, it checks: "Is this token valid? Is this user allowed to do this?" Enforces role-based access (admin vs. regular user).
+
+Rate Limiter — Prevents abuse by limiting how many requests a user can make per minute/hour. Uses algorithms like token bucket (tokens refill at a fixed rate) or sliding window. Without this, one user could overwhelm your servers or rack up massive LLM API costs.
+
+Safety / Input Filter — Scans incoming messages for prompt injection attacks, PII (personally identifiable information), and toxic content before they reach the LLM. Also filters the LLM's output for harmful responses.
+
+Backend API Server — The core application server (FastAPI, Node.js, or Go). Contains business logic: managing conversations, user accounts, billing, etc.
+
+Chat Orchestrator — The conductor. It manages conversation history (context window), decides when to call the LLM, when to retrieve documents via RAG, and when to call external tools/APIs. It assembles the final prompt sent to the LLM.
+
+LLM Service — The interface to the large language model (GPT-4, Claude, Llama, etc.). Handles prompt construction, API calls to the model provider, and streaming responses back.
+
+Redis Cache — An in-memory key-value store used for three things: (1) caching user sessions, (2) caching embeddings so you don't re-embed the same text, (3) semantic caching — if a similar question was asked before, return the cached answer instead of calling the LLM again.
+
+Message Queue — For asynchronous work that doesn't need to block the chat response. Example: when a user uploads a PDF, the document processing job goes into the queue and runs in the background (Kafka, RabbitMQ, or Celery).
+
+Vector Database — A specialized database (Pinecone, Weaviate, pgvector) that stores embeddings — numerical representations of text. It can find the most mathematically similar documents to a user's question. This is the core of RAG.
+
+Embedding Model — Converts text into high-dimensional vectors (arrays of numbers). Similar meanings produce similar vectors. Example: text-embedding-3-small from OpenAI.
+
+Retriever / Reranker — Takes the user's question, embeds it, searches the vector DB for the top-k most similar document chunks, then re-ranks them for relevance. The best chunks become context injected into the LLM prompt.
+
+Document Store — Where the original documents live (S3, blob storage). The retriever pulls the actual text from here after the vector DB identifies which chunks are relevant.
+
+Primary Database — PostgreSQL or MongoDB. Stores users, conversations, billing records, audit logs — all the traditional application data.
+
+Observability — Logging, distributed tracing, and metrics (Datadog, Grafana). You need to track latency, error rates, token usage, and cost per request.
+
+How a Single Message Flows (Steps 1-14)
+Here's what happens when a user types "What is our refund policy?" and hits send:
+
+User sends message — The frontend sends the message over WebSocket/SSE to the API Gateway with the user's auth token.
+
+Verify identity — The Auth Middleware checks the JWT. If invalid or expired, the request is rejected immediately (401 Unauthorized).
+
+Check quota — The Rate Limiter checks: "Has this user exceeded their message limit?" If yes, return a 429 Too Many Requests error.
+
+Safety check — The input is scanned for prompt injection, PII, and toxic content. If dangerous, the request is blocked.
+
+Forward request — The validated request is routed to the Backend API Server.
+
+Orchestrate — The Chat Orchestrator receives the message, loads conversation history, and decides: "I need to retrieve relevant documents before calling the LLM."
+
+Build prompt — The orchestrator prepares the prompt structure (system prompt + conversation history + retrieved context + user question).
+
+Retrieve context (RAG) — The question is embedded and sent to the vector database for similarity search. The retriever finds the top-k most relevant document chunks — e.g., the actual refund policy text.
+
+Similarity search — The vector DB returns the closest matches based on cosine similarity between the query embedding and stored document embeddings.
+
+Return context — The retrieved document chunks are sent back to the orchestrator and injected into the LLM prompt as context.
+
+AI response — The LLM generates a response using the retrieved context (this is what makes it "RAG" — the model grounds its answer in your actual documents, reducing hallucinations). The response streams back token-by-token.
+
+Format response — The orchestrator formats the response, may apply output safety filters, and structures it for the frontend.
+
+Stream back — The response is streamed through the API Gateway back toward the user over WebSocket/SSE.
+
+Display to user — The frontend renders the streamed tokens in real-time. The conversation is also persisted to the primary database for future reference.
+
+The Offline Ingestion Pipeline
+Separate from the live chat path, there's a background pipeline that keeps the RAG knowledge base up to date:
+
+Data Ingestion — Load documents (PDFs, HTML, docs), clean text, and split into chunks (e.g., 500-1000 tokens each with overlap).
+
+Embedding Job — Run each chunk through the embedding model to generate vectors.
+
+Vector Index Update — Upsert the embeddings into the vector database.
+
+Metadata Sync — Store document metadata (source, version, access permissions) in the primary database.
+
+This runs on a schedule (nightly) or is triggered by new document uploads.
